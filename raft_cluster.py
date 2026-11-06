@@ -10,7 +10,6 @@ MAGIC_BYTES = b"RAFT"
 HEADER_FORMAT = "!4sB I"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-# Opcodes
 OP_SET = 1
 OP_GET = 2
 OP_DELETE = 3
@@ -50,9 +49,7 @@ def recv_message(sock):
     payload = json.loads(payload_bytes.decode('utf-8'))
     return opcode, payload
 
-
 class ConnectionPool:
-    """Manages persistent socket connections to peer nodes."""
     def __init__(self):
         self.conns = {}
         self.lock = threading.Lock()
@@ -81,7 +78,6 @@ class ConnectionPool:
                     sock.close()
                 except Exception:
                     pass
-
 
 class WAL:
     def __init__(self, filename: str):
@@ -113,14 +109,12 @@ class WAL:
             os.fsync(f.fileno())
         self.file = open(self.filename, "a+b", buffering=0)
 
-
 STATE_FOLLOWER = "FOLLOWER"
 STATE_CANDIDATE = "CANDIDATE"
 STATE_LEADER = "LEADER"
 
-
 class RaftNode:
-    def __init__(self, node_id: int, peers: dict, wal_path: str, snapshot_threshold: int = 100):
+    def __init__(self, node_id: int, peers: dict, wal_path: str, snapshot_threshold: int = 50):
         self.node_id = node_id
         self.peers = peers
         self.wal_path = wal_path
@@ -130,13 +124,10 @@ class RaftNode:
         self.snapshot_threshold = snapshot_threshold
         self.conn_pool = ConnectionPool()
 
-        # Persistent metadata state (§5.2)
         self.current_term = 0
         self.voted_for = None
-
         self.log = []
 
-        # Snapshot state
         self.last_included_index = 0
         self.last_included_term = 0
 
@@ -149,7 +140,7 @@ class RaftNode:
         self.state = STATE_FOLLOWER
         self.leader_id = None
         self.kv_store = {}
-        self.client_sessions = {}  # client_id -> {"seq": int, "response": dict}
+        self.client_sessions = {}
 
         self.lock = threading.Lock()
         self.last_heartbeat_time = time.time()
@@ -159,7 +150,6 @@ class RaftNode:
         self._load_snapshot()
         self._recover_from_wal()
 
-    # --- Metadata Persistence ---
     def _load_meta(self):
         if os.path.exists(self.meta_path):
             with open(self.meta_path, "r") as f:
@@ -175,7 +165,6 @@ class RaftNode:
             os.fsync(f.fileno())
         os.replace(tmp_file, self.meta_path)
 
-    # --- Snapshot Operations ---
     def _load_snapshot(self):
         if os.path.exists(self.snapshot_path):
             with open(self.snapshot_path, "r") as f:
@@ -201,7 +190,6 @@ class RaftNode:
             os.fsync(f.fileno())
         os.replace(tmp_file, self.snapshot_path)
 
-    # --- Recovery ---
     def _recover_from_wal(self):
         with self.lock:
             self.log = self.wal.read_all()
@@ -210,12 +198,10 @@ class RaftNode:
                 self.commit_index = max(self.commit_index, entry["index"])
                 self.last_applied = max(self.last_applied, entry["index"])
 
-    # --- State Machine Execution ---
     def apply_command(self, cmd: dict):
         client_id = cmd.get("client_id")
         seq = cmd.get("seq")
 
-        # Idempotency Check
         if client_id and seq:
             session = self.client_sessions.get(client_id)
             if session and session["seq"] >= seq:
@@ -237,7 +223,6 @@ class RaftNode:
             self.client_sessions[client_id] = {"seq": seq, "response": res}
         return res
 
-    # --- Network Startup ---
     def start(self, host: str, port: int):
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -290,7 +275,6 @@ class RaftNode:
             return self.log[relative_idx]["term"]
         return 0
 
-    # --- ReadIndex Optimization for Linearizable Reads ---
     def _verify_leadership(self) -> bool:
         if self.state != STATE_LEADER:
             return False
@@ -331,7 +315,7 @@ class RaftNode:
         if opcode == OP_GET:
             if self.state == STATE_LEADER:
                 if not self._verify_leadership():
-                    return {"success": False, "error": "Stepped down during ReadIndex check"}
+                    return {"success": False, "error": "Leader validation failed"}
                 key = payload.get("key")
                 return {"success": True, "value": self.kv_store.get(key), "leader_id": self.node_id}
             else:
@@ -395,7 +379,6 @@ class RaftNode:
 
         return {"term": self.current_term, "vote_granted": vote_granted}
 
-    # --- AppendEntries & Fast Log Backtracking ---
     def _handle_append_entries(self, payload: dict) -> dict:
         term = payload["term"]
         leader_id = payload["leader_id"]
@@ -416,7 +399,6 @@ class RaftNode:
         self.leader_id = leader_id
         self.last_heartbeat_time = time.time()
 
-        # Log Consistency Verification with Fast Backtracking Optimization (§5.3)
         my_last_idx = self.last_included_index + len(self.log)
         if prev_log_index > my_last_idx:
             return {"term": self.current_term, "success": False, "conflict_index": my_last_idx + 1, "conflict_term": None}
@@ -430,7 +412,6 @@ class RaftNode:
                     conflict_index -= 1
                 return {"term": self.current_term, "success": False, "conflict_index": conflict_index, "conflict_term": conflict_term}
 
-        # Process entries
         for entry in entries:
             idx = entry["index"]
             relative_idx = idx - self.last_included_index - 1
@@ -455,7 +436,6 @@ class RaftNode:
 
         return {"term": self.current_term, "success": True}
 
-    # --- Snapshot Catch-Up (InstallSnapshot RPC) ---
     def _handle_install_snapshot(self, payload: dict) -> dict:
         term = payload["term"]
         if term < self.current_term:
@@ -511,7 +491,6 @@ class RaftNode:
                 return
             prev_index = self.next_index.get(peer_id, self.last_included_index + 1) - 1
 
-            # Trigger InstallSnapshot if follower needs entries purged via snapshot
             if prev_index < self.last_included_index:
                 req = {
                     "term": self.current_term,
@@ -566,7 +545,6 @@ class RaftNode:
                                 self.next_index[peer_id] = self.match_index[peer_id] + 1
                             self._try_advance_commit_index()
                         else:
-                            # Apply Fast Backtracking Optimization
                             conflict_index = res.get("conflict_index")
                             if conflict_index:
                                 self.next_index[peer_id] = max(1, conflict_index)
@@ -662,7 +640,6 @@ class RaftNode:
             self.log = compacted_entries
             self.wal.truncate_and_write(self.log)
             self._save_snapshot()
-
 
 class RaftClient:
     def __init__(self, cluster_nodes: list, client_id: str = "client_1"):
