@@ -1,5 +1,7 @@
 # Distributed Raft Key-Value Store: Technical Architecture & Line-by-Line Codebase Guide
 
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/721044bf-b91e-4915-b190-99f9ff2baacc" />
+
 ---
 
 ## Executive Summary
