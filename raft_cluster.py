@@ -1,3 +1,4 @@
+# raft_cluster.py
 import socket
 import struct
 import json
@@ -114,8 +115,10 @@ STATE_CANDIDATE = "CANDIDATE"
 STATE_LEADER = "LEADER"
 
 class RaftNode:
-    def __init__(self, node_id: int, peers: dict, wal_path: str, snapshot_threshold: int = 50):
+    def __init__(self, node_id: int, peers: dict, wal_path: str, host: str = "127.0.0.1", port: int = 8000, snapshot_threshold: int = 100):
         self.node_id = node_id
+        self.host = host
+        self.port = port
         self.peers = peers
         self.wal_path = wal_path
         self.meta_path = wal_path + ".meta"
@@ -127,16 +130,12 @@ class RaftNode:
         self.current_term = 0
         self.voted_for = None
         self.log = []
-
         self.last_included_index = 0
         self.last_included_term = 0
-
         self.commit_index = 0
         self.last_applied = 0
-
         self.next_index = {}
         self.match_index = {}
-
         self.state = STATE_FOLLOWER
         self.leader_id = None
         self.kv_store = {}
@@ -144,7 +143,8 @@ class RaftNode:
 
         self.lock = threading.Lock()
         self.last_heartbeat_time = time.time()
-        self.running = True
+        self.running = False
+        self.server_sock = None
 
         self._load_meta()
         self._load_snapshot()
@@ -201,7 +201,6 @@ class RaftNode:
     def apply_command(self, cmd: dict):
         client_id = cmd.get("client_id")
         seq = cmd.get("seq")
-
         if client_id and seq:
             session = self.client_sessions.get(client_id)
             if session and session["seq"] >= seq:
@@ -223,20 +222,37 @@ class RaftNode:
             self.client_sessions[client_id] = {"seq": seq, "response": res}
         return res
 
-    def start(self, host: str, port: int):
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind((host, port))
-        server_sock.listen(128)
+    def start(self, host: str = None, port: int = None):
+        with self.lock:
+            if self.running:
+                return
+            if host: self.host = host
+            if port: self.port = port
+            self.running = True
+            self.last_heartbeat_time = time.time()
 
-        threading.Thread(target=self._accept_loop, args=(server_sock,), daemon=True).start()
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind((self.host, self.port))
+        self.server_sock.listen(128)
+
+        threading.Thread(target=self._accept_loop, daemon=True).start()
         threading.Thread(target=self._election_timer_loop, daemon=True).start()
         threading.Thread(target=self._replication_loop, daemon=True).start()
 
-    def _accept_loop(self, server_sock):
+    def stop(self):
+        with self.lock:
+            self.running = False
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+
+    def _accept_loop(self):
         while self.running:
             try:
-                conn, addr = server_sock.accept()
+                conn, addr = self.server_sock.accept()
                 threading.Thread(target=self._client_handler, args=(conn,), daemon=True).start()
             except Exception:
                 break
@@ -278,7 +294,6 @@ class RaftNode:
     def _verify_leadership(self) -> bool:
         if self.state != STATE_LEADER:
             return False
-        
         term = self.current_term
         acks = 1
         needed = (len(self.peers) + 1) // 2 + 1
@@ -315,7 +330,7 @@ class RaftNode:
         if opcode == OP_GET:
             if self.state == STATE_LEADER:
                 if not self._verify_leadership():
-                    return {"success": False, "error": "Leader validation failed"}
+                    return {"success": False, "error": "Leadership lost during ReadIndex check"}
                 key = payload.get("key")
                 return {"success": True, "value": self.kv_store.get(key), "leader_id": self.node_id}
             else:
@@ -468,7 +483,7 @@ class RaftNode:
             time.sleep(0.1)
             should_start_election = False
             with self.lock:
-                if self.state != STATE_LEADER:
+                if self.state != STATE_LEADER and self.running:
                     if time.time() - self.last_heartbeat_time > timeout:
                         should_start_election = True
 
@@ -479,7 +494,7 @@ class RaftNode:
         while self.running:
             time.sleep(0.05)
             with self.lock:
-                if self.state != STATE_LEADER:
+                if self.state != STATE_LEADER or not self.running:
                     continue
 
             for pid, addr in self.peers.items():
@@ -487,7 +502,7 @@ class RaftNode:
 
     def _send_replication_to_peer(self, peer_id, peer_addr):
         with self.lock:
-            if self.state != STATE_LEADER:
+            if self.state != STATE_LEADER or not self.running:
                 return
             prev_index = self.next_index.get(peer_id, self.last_included_index + 1) - 1
 
@@ -556,7 +571,6 @@ class RaftNode:
     def _try_advance_commit_index(self):
         total_nodes = len(self.peers) + 1
         needed_quorum = (total_nodes // 2) + 1
-
         last_log_idx = self.last_included_index + len(self.log)
         for n in range(last_log_idx, self.commit_index, -1):
             if self._get_log_term(n) == self.current_term:
@@ -642,7 +656,7 @@ class RaftNode:
             self._save_snapshot()
 
 class RaftClient:
-    def __init__(self, cluster_nodes: list, client_id: str = "client_1"):
+    def __init__(self, cluster_nodes: list, client_id: str = "client_cli"):
         self.cluster_nodes = cluster_nodes
         self.leader_addr = None
         self.client_id = client_id
@@ -680,3 +694,156 @@ class RaftClient:
                 continue
 
         return {"success": False, "error": "Could not connect to cluster leader"}
+
+class ClusterManager:
+    def __init__(self):
+        self.nodes = {}
+        self.configs = {
+            1: ("127.0.0.1", 8001, {2: ("127.0.0.1", 8002), 3: ("127.0.0.1", 8003)}, "node1.wal"),
+            2: ("127.0.0.1", 8002, {1: ("127.0.0.1", 8001), 3: ("127.0.0.1", 8003)}, "node2.wal"),
+            3: ("127.0.0.1", 8003, {1: ("127.0.0.1", 8001), 2: ("127.0.0.1", 8002)}, "node3.wal"),
+        }
+        self.client_addrs = [("127.0.0.1", 8001), ("127.0.0.1", 8002), ("127.0.0.1", 8003)]
+        self.client = RaftClient(self.client_addrs)
+
+    def start_all(self):
+        for nid, (host, port, peers, wal) in self.configs.items():
+            node = RaftNode(node_id=nid, peers=peers, wal_path=wal, host=host, port=port)
+            node.start()
+            self.nodes[nid] = node
+
+    def stop_all(self):
+        for node in self.nodes.values():
+            node.stop()
+
+    def kill_node(self, nid: int):
+        if nid in self.nodes:
+            self.nodes[nid].stop()
+            return True
+        return False
+
+    def restart_node(self, nid: int):
+        if nid in self.nodes:
+            self.nodes[nid].stop()
+            host, port, peers, wal = self.configs[nid]
+            new_node = RaftNode(node_id=nid, peers=peers, wal_path=wal, host=host, port=port)
+            new_node.start()
+            self.nodes[nid] = new_node
+            return True
+        return False
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def render_dashboard(manager: ClusterManager):
+    clear_screen()
+    print("┌────────────────────────────────────────────────────────────────────────┐")
+    print("│                  DISTRIBUTED RAFT KV-STORE CONTROL PANEL               │")
+    print("├────────────────────────────────────────────────────────────────────────┤")
+    print(f"│ {'ID':<4} │ {'HOST:PORT':<15} │ {'STATE':<10} │ {'TERM':<6} │ {'COMMIT':<8} │ {'KEYS':<6} │")
+    print("├──────┼─────────────────┼────────────┼────────┼──────────┼──────────┤")
+    
+    for nid, node in sorted(manager.nodes.items()):
+        with node.lock:
+            state = node.state
+            term = node.current_term
+            commit = node.commit_index
+            kcount = len(node.kv_store)
+            running = node.running
+        
+        if not running:
+            state = "OFFLINE"
+        
+        host_port = f"{node.host}:{node.port}"
+        print(f"│ #{nid:<3} │ {host_port:<15} │ {state:<10} │ {term:<6} │ {commit:<8} │ {kcount:<6} │")
+    
+    print("└──────┴─────────────────┴────────────┴────────┴──────────┴──────────┘")
+    print(" COMMANDS:                                                               ")
+    print("   set <key> <val>     - Write key-value pair                            ")
+    print("   get <key>           - Retrieve value (ReadIndex linearizable)         ")
+    print("   del <key>           - Delete key                                      ")
+    print("   app <key> <val>     - Append string to key                            ")
+    print("   kill <node_id>      - Simulate node crash / network isolation         ")
+    print("   start <node_id>     - Restart offline node                            ")
+    print("   refresh             - Redraw dashboard                                ")
+    print("   exit                - Terminate cluster and exit                      ")
+    print("─────────────────────────────────────────────────────────────────────────")
+
+def main():
+    manager = ClusterManager()
+    manager.start_all()
+    time.sleep(1.5)
+
+    while True:
+        render_dashboard(manager)
+        try:
+            cmd_line = input("RAFT-CLI> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            break
+
+        if not cmd_line:
+            continue
+
+        parts = cmd_line.split(" ", 2)
+        action = parts[0].lower()
+
+        if action == "exit":
+            print("\nShutting down cluster nodes...")
+            manager.stop_all()
+            break
+        elif action == "refresh":
+            continue
+        elif action == "kill":
+            if len(parts) > 1 and parts[1].isdigit():
+                nid = int(parts[1])
+                success = manager.kill_node(nid)
+                print(f"Node #{nid} shutdown: {success}")
+            else:
+                print("Usage: kill <node_id>")
+            time.sleep(1)
+        elif action == "start":
+            if len(parts) > 1 and parts[1].isdigit():
+                nid = int(parts[1])
+                success = manager.restart_node(nid)
+                print(f"Node #{nid} started: {success}")
+            else:
+                print("Usage: start <node_id>")
+            time.sleep(1)
+        elif action == "set":
+            if len(parts) == 3:
+                key, val = parts[1], parts[2]
+                res = manager.client.execute(OP_SET, {"key": key, "value": val})
+                print(f"RESULT: {res}")
+            else:
+                print("Usage: set <key> <value>")
+            input("\nPress Enter to continue...")
+        elif action == "get":
+            if len(parts) == 2:
+                key = parts[1]
+                res = manager.client.execute(OP_GET, {"key": key})
+                print(f"RESULT: {res}")
+            else:
+                print("Usage: get <key>")
+            input("\nPress Enter to continue...")
+        elif action == "del":
+            if len(parts) == 2:
+                key = parts[1]
+                res = manager.client.execute(OP_DELETE, {"key": key})
+                print(f"RESULT: {res}")
+            else:
+                print("Usage: del <key>")
+            input("\nPress Enter to continue...")
+        elif action == "app":
+            if len(parts) == 3:
+                key, val = parts[1], parts[2]
+                res = manager.client.execute(OP_APPEND, {"key": key, "value": val})
+                print(f"RESULT: {res}")
+            else:
+                print("Usage: app <key> <value>")
+            input("\nPress Enter to continue...")
+        else:
+            print(f"Unknown command: {action}")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()
