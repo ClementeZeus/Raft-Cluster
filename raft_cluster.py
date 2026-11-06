@@ -82,14 +82,20 @@ STATE_CANDIDATE = "CANDIDATE"
 STATE_LEADER = "LEADER"
 
 class RaftNode:
-    def __init__(self, node_id: int, peers: dict, wal_path: str):
+    def __init__(self, node_id: int, peers: dict, wal_path: str, snapshot_threshold: int = 100):
         self.node_id = node_id
         self.peers = peers
+        self.wal_path = wal_path
         self.wal = WAL(wal_path)
+        self.snapshot_threshold = snapshot_threshold
 
         self.current_term = 0
         self.voted_for = None
         self.log = []
+
+        # Snapshot state
+        self.last_included_index = 0
+        self.last_included_term = 0
 
         self.commit_index = 0
         self.last_applied = 0
@@ -108,11 +114,12 @@ class RaftNode:
         self._recover_from_wal()
 
     def _recover_from_wal(self):
-        self.log = self.wal.read_all()
-        for entry in self.log:
-            self.apply_command(entry["command"])
-            self.commit_index = entry["index"]
-            self.last_applied = entry["index"]
+        with self.lock:
+            self.log = self.wal.read_all()
+            for entry in self.log:
+                self.apply_command(entry["command"])
+                self.commit_index = max(self.commit_index, entry["index"])
+                self.last_applied = max(self.last_applied, entry["index"])
 
     def apply_command(self, cmd: dict):
         op = cmd.get("op")
@@ -133,6 +140,7 @@ class RaftNode:
 
         threading.Thread(target=self._accept_loop, args=(server_sock,), daemon=True).start()
         threading.Thread(target=self._election_timer_loop, daemon=True).start()
+        threading.Thread(target=self._replication_loop, daemon=True).start()
 
     def _accept_loop(self, server_sock):
         while self.running:
@@ -164,6 +172,14 @@ class RaftNode:
                 return self._handle_append_entries(payload)
             return {"success": False, "error": "Unknown opcode"}
 
+    def _get_log_term(self, index: int) -> int:
+        if index == self.last_included_index:
+            return self.last_included_term
+        relative_idx = index - self.last_included_index - 1
+        if 0 <= relative_idx < len(self.log):
+            return self.log[relative_idx]["term"]
+        return 0
+
     def _handle_client_cmd(self, opcode: int, payload: dict) -> dict:
         if opcode == OP_GET:
             key = payload.get("key")
@@ -176,59 +192,21 @@ class RaftNode:
         op_names = {OP_SET: "SET", OP_DELETE: "DELETE", OP_APPEND: "APPEND"}
         cmd = {"op": op_names[opcode], "key": payload.get("key"), "value": payload.get("value")}
 
-        new_index = len(self.log) + 1
+        last_log_idx = self.last_included_index + len(self.log)
+        new_index = last_log_idx + 1
         entry = {"term": self.current_term, "index": new_index, "command": cmd}
         self.log.append(entry)
         self.wal.append_log(self.current_term, new_index, cmd)
+        self.match_index[self.node_id] = new_index
 
-        acks = 1
-        total_nodes = len(self.peers) + 1
-        needed_acks = (total_nodes // 2) + 1
-        ack_lock = threading.Lock()
-
-        def send_replica(peer_id, peer_addr):
-            nonlocal acks
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1.0)
-                s.connect((peer_addr[0], peer_addr[1]))
-                req = {
-                    "term": self.current_term,
-                    "leader_id": self.node_id,
-                    "prev_log_index": new_index - 1,
-                    "prev_log_term": self.log[new_index - 2]["term"] if new_index > 1 else 0,
-                    "entries": [entry],
-                    "leader_commit": self.commit_index
-                }
-                send_message(s, OP_RAFT_APPEND_ENTRIES, req)
-                _, res = recv_message(s)
-                s.close()
-                if res and res.get("success"):
-                    with ack_lock:
-                        acks += 1
-            except Exception:
-                pass
-
-        threads = []
-        for pid, addr in self.peers.items():
-            t = threading.Thread(target=send_replica, args=(pid, addr))
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join(timeout=1.0)
-
-        if acks >= needed_acks:
-            self.commit_index = new_index
-            self.apply_command(cmd)
-            self.last_applied = new_index
-            return {"success": True, "index": new_index}
-        else:
-            return {"success": False, "error": "Failed to reach consensus majority"}
+        self._check_snapshot()
+        return {"success": True, "index": new_index}
 
     def _handle_request_vote(self, payload: dict) -> dict:
         term = payload["term"]
         candidate_id = payload["candidate_id"]
+        last_log_index = payload["last_log_index"]
+        last_log_term = payload["last_log_term"]
 
         if term > self.current_term:
             self.current_term = term
@@ -236,7 +214,13 @@ class RaftNode:
             self.voted_for = None
 
         vote_granted = False
-        if (self.voted_for is None or self.voted_for == candidate_id) and term == self.current_term:
+        my_last_index = self.last_included_index + len(self.log)
+        my_last_term = self._get_log_term(my_last_index)
+
+        log_ok = (last_log_term > my_last_term) or \
+                 (last_log_term == my_last_term and last_log_index >= my_last_index)
+
+        if term == self.current_term and (self.voted_for is None or self.voted_for == candidate_id) and log_ok:
             vote_granted = True
             self.voted_for = candidate_id
             self.last_heartbeat_time = time.time()
@@ -246,6 +230,8 @@ class RaftNode:
     def _handle_append_entries(self, payload: dict) -> dict:
         term = payload["term"]
         leader_id = payload["leader_id"]
+        prev_log_index = payload["prev_log_index"]
+        prev_log_term = payload["prev_log_term"]
         entries = payload.get("entries", [])
         leader_commit = payload.get("leader_commit", 0)
 
@@ -260,20 +246,34 @@ class RaftNode:
         self.leader_id = leader_id
         self.last_heartbeat_time = time.time()
 
+        # Enforce Log Matching Property (§5.3)
+        if prev_log_index > 0:
+            my_term_at_prev = self._get_log_term(prev_log_index)
+            if my_term_at_prev != prev_log_term:
+                return {"term": self.current_term, "success": False}
+
+        # Process and reconcile entries
         for entry in entries:
             idx = entry["index"]
-            if idx <= len(self.log):
-                self.log[idx - 1] = entry
-            else:
-                self.log.append(entry)
-            self.wal.append_log(entry["term"], entry["index"], entry["command"])
+            relative_idx = idx - self.last_included_index - 1
+            if relative_idx >= 0:
+                if relative_idx < len(self.log):
+                    if self.log[relative_idx]["term"] != entry["term"]:
+                        self.log = self.log[:relative_idx]
+                        self.log.append(entry)
+                        self.wal.truncate_and_write(self.log)
+                else:
+                    self.log.append(entry)
+                    self.wal.append_log(entry["term"], entry["index"], entry["command"])
 
         if leader_commit > self.commit_index:
-            self.commit_index = min(leader_commit, len(self.log))
+            self.commit_index = min(leader_commit, self.last_included_index + len(self.log))
             while self.last_applied < self.commit_index:
                 self.last_applied += 1
-                cmd = self.log[self.last_applied - 1]["command"]
-                self.apply_command(cmd)
+                if self.last_applied > self.last_included_index:
+                    rel_idx = self.last_applied - self.last_included_index - 1
+                    if 0 <= rel_idx < len(self.log):
+                        self.apply_command(self.log[rel_idx]["command"])
 
         return {"term": self.current_term, "success": True}
 
@@ -282,42 +282,105 @@ class RaftNode:
             timeout = random.uniform(1.5, 3.0)
             time.sleep(0.1)
 
+            should_start_election = False
             with self.lock:
-                if self.state == STATE_LEADER:
-                    self._send_heartbeats()
-                    time.sleep(0.5)
+                if self.state != STATE_LEADER:
+                    if time.time() - self.last_heartbeat_time > timeout:
+                        should_start_election = True
+
+            if should_start_election:
+                self._start_election()
+
+    def _replication_loop(self):
+        while self.running:
+            time.sleep(0.05)
+            with self.lock:
+                if self.state != STATE_LEADER:
                     continue
 
-                if time.time() - self.last_heartbeat_time > timeout:
-                    self._start_election()
+            for pid, addr in self.peers.items():
+                threading.Thread(target=self._send_append_entries_to_peer, args=(pid, addr), daemon=True).start()
 
-    def _send_heartbeats(self):
-        for pid, addr in self.peers.items():
-            def send_hb(peer_addr):
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(0.5)
-                    s.connect((peer_addr[0], peer_addr[1]))
-                    req = {
-                        "term": self.current_term,
-                        "leader_id": self.node_id,
-                        "prev_log_index": len(self.log),
-                        "prev_log_term": self.log[-1]["term"] if self.log else 0,
-                        "entries": [],
-                        "leader_commit": self.commit_index
-                    }
-                    send_message(s, OP_RAFT_APPEND_ENTRIES, req)
-                    s.close()
-                except Exception:
-                    pass
-            threading.Thread(target=send_hb, args=(addr,), daemon=True).start()
+    def _send_append_entries_to_peer(self, peer_id, peer_addr):
+        with self.lock:
+            if self.state != STATE_LEADER:
+                return
+            prev_index = self.next_index.get(peer_id, self.last_included_index + 1) - 1
+            prev_term = self._get_log_term(prev_index)
+            
+            entries_to_send = []
+            for entry in self.log:
+                if entry["index"] > prev_index:
+                    entries_to_send.append(entry)
+
+            req = {
+                "term": self.current_term,
+                "leader_id": self.node_id,
+                "prev_log_index": prev_index,
+                "prev_log_term": prev_term,
+                "entries": entries_to_send,
+                "leader_commit": self.commit_index
+            }
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect((peer_addr[0], peer_addr[1]))
+            send_message(s, OP_RAFT_APPEND_ENTRIES, req)
+            _, res = recv_message(s)
+            s.close()
+
+            if res:
+                with self.lock:
+                    if res.get("term") > self.current_term:
+                        self.current_term = res["term"]
+                        self.state = STATE_FOLLOWER
+                        self.voted_for = None
+                        return
+
+                    if self.state == STATE_LEADER:
+                        if res.get("success"):
+                            if entries_to_send:
+                                last_sent_index = entries_to_send[-1]["index"]
+                                self.match_index[peer_id] = max(self.match_index.get(peer_id, 0), last_sent_index)
+                                self.next_index[peer_id] = self.match_index[peer_id] + 1
+                            self._try_advance_commit_index()
+                        else:
+                            self.next_index[peer_id] = max(1, self.next_index.get(peer_id, 1) - 1)
+        except Exception:
+            pass
+
+    def _try_advance_commit_index(self):
+        total_nodes = len(self.peers) + 1
+        needed_quorum = (total_nodes // 2) + 1
+        
+        last_log_idx = self.last_included_index + len(self.log)
+        for n in range(last_log_idx, self.commit_index, -1):
+            if self._get_log_term(n) == self.current_term:
+                matches = 1  
+                for pid in self.peers:
+                    if self.match_index.get(pid, 0) >= n:
+                        matches += 1
+                if matches >= needed_quorum:
+                    self.commit_index = n
+                    while self.last_applied < self.commit_index:
+                        self.last_applied += 1
+                        if self.last_applied > self.last_included_index:
+                            rel_idx = self.last_applied - self.last_included_index - 1
+                            if 0 <= rel_idx < len(self.log):
+                                self.apply_command(self.log[rel_idx]["command"])
+                    break
 
     def _start_election(self):
-        self.state = STATE_CANDIDATE
-        self.current_term += 1
-        self.voted_for = self.node_id
-        self.last_heartbeat_time = time.time()
-        votes = 1
+        with self.lock:
+            self.state = STATE_CANDIDATE
+            self.current_term += 1
+            self.voted_for = self.node_id
+            self.last_heartbeat_time = time.time()
+            votes = 1
+            term = self.current_term
+            last_log_idx = self.last_included_index + len(self.log)
+            last_log_term = self._get_log_term(last_log_idx)
 
         total_nodes = len(self.peers) + 1
         needed_votes = (total_nodes // 2) + 1
@@ -330,17 +393,24 @@ class RaftNode:
                 s.settimeout(0.5)
                 s.connect((addr[0], addr[1]))
                 req = {
-                    "term": self.current_term,
+                    "term": term,
                     "candidate_id": self.node_id,
-                    "last_log_index": len(self.log),
-                    "last_log_term": self.log[-1]["term"] if self.log else 0
+                    "last_log_index": last_log_idx,
+                    "last_log_term": last_log_term
                 }
                 send_message(s, OP_RAFT_VOTE, req)
                 _, res = recv_message(s)
                 s.close()
-                if res and res.get("vote_granted"):
-                    with vote_lock:
-                        votes += 1
+                if res:
+                    with self.lock:
+                        if res.get("term") > self.current_term:
+                            self.current_term = res["term"]
+                            self.state = STATE_FOLLOWER
+                            self.voted_for = None
+                            return
+                    if res.get("vote_granted"):
+                        with vote_lock:
+                            votes += 1
             except Exception:
                 pass
 
@@ -353,10 +423,23 @@ class RaftNode:
         for t in threads:
             t.join(timeout=0.5)
 
-        if votes >= needed_votes and self.state == STATE_CANDIDATE:
-            self.state = STATE_LEADER
-            self.leader_id = self.node_id
-            self._send_heartbeats()
+        with self.lock:
+            if votes >= needed_votes and self.state == STATE_CANDIDATE:
+                self.state = STATE_LEADER
+                self.leader_id = self.node_id
+                last_idx = self.last_included_index + len(self.log)
+                for pid in self.peers:
+                    self.next_index[pid] = last_idx + 1
+                    self.match_index[pid] = self.last_included_index
+
+    def _check_snapshot(self):
+        if len(self.log) > self.snapshot_threshold:
+            snapshot_count = len(self.log) // 2
+            compacted_entries = self.log[snapshot_count:]
+            self.last_included_index = self.log[snapshot_count - 1]["index"]
+            self.last_included_term = self.log[snapshot_count - 1]["term"]
+            self.log = compacted_entries
+            self.wal.truncate_and_write(self.log)
 
 class RaftClient:
     def __init__(self, cluster_nodes: list):
